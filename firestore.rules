@@ -1,0 +1,110 @@
+rules_version = '2';
+
+// Sangam Firestore security rules — no Cloud Functions edition.
+//
+// HOW TO APPLY: `firebase deploy --only firestore:rules`, or paste this into
+// Firebase console → Firestore Database → Rules → Publish.
+//
+// Model (no custom claims, no Cloud Functions — everything runs on the free
+// Spark plan):
+//   - A shop's id IS the owner's own Firebase Auth uid. The owner creates
+//     /shops/{ownUid} directly after phone-verifying — trivially safe since
+//     the rule just checks request.auth.uid == shopId.
+//   - Staff self-register with an invite code the owner generates and shares.
+//     Claiming a code atomically marks it used and creates the staff's own
+//     membership doc at /shops/{shopId}/staff/{their own uid} — a staff
+//     member can only ever create a membership doc for THEIR OWN uid, and
+//     only by consuming a genuine, not-yet-used invite for that shop.
+//   - /staffIndex/{uid} is a tiny reverse lookup ("which shop am I in?") so a
+//     staff member's own device can find their shop without a collection
+//     group query. Only that uid can read or write their own index entry.
+//   - Every other read/write checks either "I am the owner" or "a genuine
+//     staff membership doc for me exists under this shop".
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isOwner(shopId) {
+      return request.auth != null && request.auth.uid == shopId;
+    }
+
+    function isMember(shopId) {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/shops/$(shopId)/staff/$(request.auth.uid));
+    }
+
+    function canEditShop(shopId) {
+      return isOwner(shopId) || (
+        isMember(shopId) &&
+        get(/databases/$(database)/documents/shops/$(shopId)/staff/$(request.auth.uid)).data.canEdit == true
+      );
+    }
+
+    // The shop's own root doc (profile, owner name, etc).
+    match /shops/{shopId} {
+      allow read: if isOwner(shopId) || isMember(shopId);
+      allow write: if isOwner(shopId);
+    }
+
+    // Staff membership docs.
+    match /shops/{shopId}/staff/{staffUid} {
+      allow read: if isOwner(shopId) || isMember(shopId);
+
+      // A staff member can only ever create THEIR OWN membership doc, and
+      // only by presenting a genuine invite for this exact shop that they
+      // themselves already marked used (see the /invites rules below — the
+      // invite claim and this doc creation happen together as one batch from
+      // the client, so both must satisfy their rules in the same commit).
+      allow create: if request.auth != null && request.auth.uid == staffUid
+        && request.resource.data.inviteCode is string
+        && get(/databases/$(database)/documents/invites/$(request.resource.data.inviteCode)).data.shopId == shopId
+        && getAfter(/databases/$(database)/documents/invites/$(request.resource.data.inviteCode)).data.claimedBy == request.auth.uid;
+
+      // Only the owner edits or removes staff.
+      allow update, delete: if isOwner(shopId);
+    }
+
+    // One-time invite codes. Top-level (not nested under /shops) so a
+    // brand-new staff signup — who isn't a member of any shop yet — can look
+    // one up by its code alone, without already knowing the shopId.
+    match /invites/{code} {
+      allow get: if request.auth != null;   // must already know the exact code
+      allow list: if false;                 // never enumerable
+
+      // Only a shop's owner can create an invite for their own shop.
+      allow create: if isOwner(request.resource.data.shopId)
+        && request.resource.data.used == false;
+
+      // Claiming: flips used false → true exactly once, stamped with the
+      // claimer's own uid. Firestore's per-document atomicity means only one
+      // of two simultaneous claims can ever win this check.
+      allow update: if request.auth != null
+        && resource.data.used == false
+        && request.resource.data.used == true
+        && request.resource.data.shopId == resource.data.shopId
+        && request.resource.data.canEdit == resource.data.canEdit
+        && request.resource.data.claimedBy == request.auth.uid;
+
+      // The owner can revoke a code they haven't shared yet / no longer want used.
+      allow delete: if isOwner(resource.data.shopId);
+    }
+
+    // "Which shop am I in?" reverse lookup — only the staff member themselves
+    // can read or write their own entry.
+    match /staffIndex/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Ledger data: customers, transactions, products.
+    match /shops/{shopId}/{collection}/{docId} {
+      allow read: if (isOwner(shopId) || isMember(shopId))
+        && collection in ['customers', 'transactions', 'products'];
+      allow write: if canEditShop(shopId)
+        && collection in ['customers', 'transactions', 'products'];
+    }
+
+    // Deny everything outside the above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
